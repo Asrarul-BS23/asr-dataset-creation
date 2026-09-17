@@ -1,0 +1,79 @@
+# Pipeline configuration. Every script reads this; CLI flags override.
+
+paths:
+  root: "data"
+  raw: "data/raw"            # {video_id}.flac  -- 16 kHz mono, immutable
+  meta: "data/meta"          # {video_id}.json  -- youtube metadata + provenance
+  segments: "data/segments"  # {video_id}/{seg_id}.flac
+  manifests: "data/manifests"
+  dataset: "data/hf_dataset"
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  codec: flac
+
+download:
+  # Only download videos in this duration range (seconds). Skips Shorts and marathons.
+  min_duration: 300
+  max_duration: 7200
+  # "any" | "creativeCommon"  -- creativeCommon is the safe default for redistribution
+  license_filter: any
+  skip_live: true
+  max_videos_per_channel: 50
+  sleep_interval: 2          # be polite; seconds between downloads
+
+segment:
+  min_duration: 15.0         # hard floor (except the last segment of a file)
+  max_duration: 25.0         # hard ceiling
+  target_duration: 20.0      # DP pulls toward this
+  pad: 0.15                  # seconds of silence kept either side of speech
+  min_speech_ratio: 0.55     # drop segments that are mostly silence
+  # VAD
+  vad_threshold: 0.5
+  min_silence_ms: 250        # gaps shorter than this are not boundary candidates
+  min_speech_ms: 250
+  # DP cost weights
+  w_target: 1.0              # deviation from target_duration
+  w_pause: 3.0               # reward for cutting at a long pause  <-- raise to favour clean cuts
+  w_silence: 0.5             # penalty for silence trapped inside a segment
+  pause_saturation: 1.5      # pauses longer than this are all "equally good"
+
+transcribe:
+  # Either a Hub repo id or a LOCAL DIRECTORY PATH. Both work, and both accept either
+  # a full fine-tune (config.json) or a PEFT/LoRA adapter (adapter_config.json) --
+  # the adapter's base model is resolved automatically.
+  #
+  #   model_id: "YOUR_HF_USERNAME/whisper-large-v3-banglish-lora"   # Hub
+  #   model_id: "D:/models/whisper-banglish-lora"                   # local, absolute
+  #   model_id: "./checkpoints/checkpoint-4000"                     # local, relative
+  #
+  # A local path never touches the network, so this works fully offline.
+  model_id: "YOUR_HF_USERNAME/whisper-large-v3-banglish-lora"
+
+  # Base model for a LoRA adapter. Also accepts a local path. Leave null to read it
+  # from adapter_config.json; set it if that field is missing, wrong, or you want the
+  # base loaded from local disk too.
+  base_model_id: null
+  language: "bn"
+  task: "transcribe"
+  batch_size: 24               # DGX Spark has 128 GB unified memory; raise until VRAM bites
+  num_beams: 5
+  # Anti-hallucination / anti-drift. See rnd-docs/01.
+  condition_on_prev_text: false
+  no_repeat_ngram_size: 0
+  compression_ratio_threshold: 2.4
+  logprob_threshold: -1.0
+  device: "cuda"             # "cuda" | "cpu" -- cuda fails loudly, never silently falls back
+  dtype: "bfloat16"          # bfloat16 on Blackwell/Ampere+; float16 | float32 otherwise
+  initial_prompt: null       # e.g. "startup, funding, deployment, API, machine learning"
+
+dataset:
+  name: "banglish-asr"
+  test_size: 0.05
+  dev_size: 0.05
+  seed: 13
+  # Splits are grouped by video_id so no video straddles two splits.
+  push_to_hub: false
+  hub_id: "YOUR_HF_USERNAME/banglish-asr"
+  private: true
