@@ -1,1 +1,140 @@
+# ---------------------------------------------------------------- project-specific
+# R&D notes kept out of version control (pre-existing choice -- see note in README)
 rnd-docs/
+
+# ---------------------------------------------------------------- corpus data
+# Audio is far too large for git and, for YouTube-sourced material, must not be
+# redistributed at all. See rnd-docs/03-youtube-sourcing.md.
+#
+# NOTE: this is `data/*`, not `data/`, on purpose. Git refuses to descend into an
+# excluded DIRECTORY, so with a bare `data/` no `!` rule below could ever re-include
+# anything under it. Ignoring the CONTENTS instead keeps the negations working.
+data/*
+
+# Hand-curated inputs, not generated artifacts, so they MUST be versioned: the lexicons
+# decide orthography (rnd-docs/04) and changing them silently invalidates every
+# transcript annotated before the change.
+!data/lexicon/
+!data/.gitkeep
+
+# Manifests are the actual releasable dataset (no audio, just IDs + timestamps + text).
+# Ignored by default because they reach tens of MB at corpus scale. To track them,
+# delete this line and use Git LFS:
+#   git lfs track "data/manifests/*.jsonl"
+data/manifests/
+
+# Loose audio anywhere in the tree
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.opus
+*.ogg
+*.webm
+*.mp4
+*.mkv
+
+# ---------------------------------------------------------------- models & training
+checkpoints/
+runs/
+outputs/
+lightning_logs/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+*.gguf
+
+# Adapter dirs pulled down or trained locally
+adapter_model/
+lora_out/
+
+# Experiment tracking & caches
+wandb/
+mlruns/
+.cache/
+.huggingface/
+huggingface/
+torch_hub/
+*.lock
+
+# Keep experiment results -- these are the point of the project (rnd-docs/06, /08)
+!results/
+!results/**
+
+# ---------------------------------------------------------------- secrets
+# HF tokens, YouTube Data API keys. Never commit these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+credentials.json
+client_secret*.json
+token.json
+
+# A local config override, so the committed configs/pipeline.yaml stays generic
+configs/*.local.yaml
+configs/local/
+
+# ---------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+conda-meta/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Notebooks
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ---------------------------------------------------------------- editors & OS
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------- misc
+*.log
+logs/
+tmp/
+temp/
+scratch/
+nohup.out
