@@ -1,20 +1,25 @@
-"""Transcribe segments with your own Whisper model from the Hugging Face Hub.
+"""Transcribe segments with your own Whisper model.
 
-Handles both repo shapes automatically:
-  * a full fine-tune  -> loaded directly
-  * a PEFT/LoRA adapter -> base model pulled from adapter_config.json, adapter merged in
+Two backends, chosen automatically from what is actually in the model directory:
 
-Per segment it records the decoder's own quality signals (average token log-probability
-and the gzip compression ratio of the text) so the confidence gate in
+  * **CTranslate2 / faster-whisper** -- `model.bin` + `vocabulary.json`.
+    Much faster for bulk pseudo-labelling, and it reports `avg_logprob` and
+    `no_speech_prob` natively rather than having them reconstructed from logits.
+  * **HF transformers** -- `config.json` + `model.safetensors`, or a PEFT/LoRA adapter
+    (`adapter_config.json`), whose base model is resolved and merged in automatically.
+
+Either backend accepts a Hub repo id or a local directory path.
+
+Per segment it records the decoder's own quality signals so the confidence gate in
 rnd-docs/05-pseudo-label-pipeline.md has something to work with. Do not skip these --
 they are what lets you route segments to annotators by expected error rather than at
 random.
 
 Usage
 -----
-    python src/transcribe.py
+    python src/transcribe.py --model-path /home/me/outputs/faster-whisper-bangla-lora
     python src/transcribe.py --model-id myname/whisper-large-v3-banglish-lora
-    python src/transcribe.py --video dQw4w9WgXcQ --overwrite
+    python src/transcribe.py --backend hf --model-path ./checkpoints/checkpoint-4000
 """
 
 from __future__ import annotations
@@ -25,13 +30,12 @@ import zlib
 from pathlib import Path
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
 from common import ensure_dirs, load_audio, load_config, read_jsonl, write_jsonl
 from normalize import normalize_text
 
-DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+SR = 16000
 
 
 def _wheel_index_url() -> str:
@@ -47,6 +51,17 @@ def _wheel_index_url() -> str:
     if platform.machine().lower() in ("aarch64", "arm64"):
         return "https://download.pytorch.org/whl/cu130"
     return "https://download.pytorch.org/whl/cu124"
+
+
+def compression_ratio(text: str) -> float:
+    """Whisper's repetition detector. >2.4 means the decoder is looping."""
+    data = text.encode("utf-8")
+    if not data:
+        return 0.0
+    return len(data) / len(zlib.compress(data))
+
+
+# --------------------------------------------------------------------- model resolution
 
 
 def resolve_model_source(model_id: str) -> tuple[bool, str | None, bool]:
@@ -71,13 +86,11 @@ def resolve_model_source(model_id: str) -> tuple[bool, str | None, bool]:
             return True, base, True
         if not (local_dir / "config.json").exists():
             raise SystemExit(
-                f"{local_dir} exists but holds neither config.json (full model) nor "
-                f"adapter_config.json (LoRA adapter)."
+                f"{local_dir} exists but holds neither config.json (full model / CT2) "
+                f"nor adapter_config.json (LoRA adapter)."
             )
         return False, None, True
 
-    # Looks like a path the user meant but mistyped -- fail loudly rather than
-    # asking the Hub for a repo named "D:/models/...".
     if any(sep in model_id for sep in ("\\", "/")) and len(model_id.split("/")) != 2:
         raise SystemExit(f"Local model path not found: {model_id}")
     if Path(model_id).suffix or model_id.startswith("."):
@@ -94,144 +107,265 @@ def resolve_model_source(model_id: str) -> tuple[bool, str | None, bool]:
     ), False
 
 
-def load_model(cfg: dict):
-    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+def detect_backend(model_id: str) -> str:
+    """'ct2' or 'hf', from what the directory actually contains.
 
-    tcfg = cfg["transcribe"]
-    model_id = tcfg["model_id"]
-    device = tcfg["device"]
+    A CTranslate2 export is `model.bin` plus a `vocabulary.*` file and a config.json
+    that is NOT an HF model config. HF checkpoints carry model.safetensors (or the
+    legacy pytorch_model.bin) instead.
+    """
+    d = Path(model_id).expanduser()
+    if not d.is_dir():
+        return "hf"  # Hub repo ids are assumed HF; pass --backend ct2 to override
+    if (d / "model.safetensors").exists() or (d / "pytorch_model.bin").exists():
+        return "hf"
+    if (d / "adapter_config.json").exists():
+        return "hf"
+    if (d / "model.bin").exists() and any(d.glob("vocabulary.*")):
+        return "ct2"
+    return "hf"
 
-    if device.startswith("cuda"):
-        # Fail loudly. A silent CPU fallback on large-v3 is ~50x slower and easy to miss
-        # until you have burned a night on it.
-        if not torch.cuda.is_available():
+
+# ------------------------------------------------------------------------- CT2 backend
+
+
+class CT2Backend:
+    """faster-whisper / CTranslate2. The fast path for bulk pseudo-labelling."""
+
+    name = "ct2"
+
+    def __init__(self, cfg: dict):
+        tcfg = cfg["transcribe"]
+        self.tcfg = tcfg
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
             raise SystemExit(
-                "device: cuda requested but torch.cuda.is_available() is False.\n"
-                f"  torch {torch.__version__}, built for CUDA {torch.version.cuda}, "
-                f"machine {platform.machine()}\n"
-                f"Install a CUDA build (cuDNN ships inside the wheel, nothing extra needed):\n"
-                f"  pip install torch torchaudio --index-url {_wheel_index_url()}\n"
-                "Or set transcribe.device: cpu to run without a GPU."
+                "This model is in CTranslate2 format but faster-whisper is not installed.\n"
+                "  pip install faster-whisper\n"
+                f"If the CUDA build will not install on {platform.machine()}, point\n"
+                "--model-path at the pre-conversion HF checkpoint instead, or pass\n"
+                "--backend hf."
+            ) from None
+
+        # CT2 names its precisions differently from torch.
+        compute_type = {
+            "bfloat16": "bfloat16",
+            "float16": "float16",
+            "float32": "float32",
+        }.get(tcfg["dtype"], "float16")
+        device = "cuda" if tcfg["device"].startswith("cuda") else "cpu"
+        if device == "cpu" and compute_type in ("float16", "bfloat16"):
+            compute_type = "int8"
+
+        print(f"Loading CTranslate2 model ({device}, {compute_type}): {tcfg['model_id']}")
+        try:
+            self.model = WhisperModel(
+                str(Path(tcfg["model_id"]).expanduser()),
+                device=device,
+                compute_type=compute_type,
             )
-        # cuDNN is bundled with the torch wheel; these just flip flags on it.
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True  # fixed 30 s input shape -> stable kernels
+        except (ValueError, RuntimeError) as exc:
+            if compute_type == "bfloat16":
+                print(f"  bfloat16 unsupported here ({exc}); falling back to float16.")
+                self.model = WhisperModel(
+                    str(Path(tcfg["model_id"]).expanduser()),
+                    device=device,
+                    compute_type="float16",
+                )
+            else:
+                raise
 
-        props = torch.cuda.get_device_properties(0)
-        cudnn_v = torch.backends.cudnn.version()
-        print(
-            f"GPU: {props.name}  sm_{props.major}{props.minor}  "
-            f"{props.total_memory / 1e9:.0f} GB\n"
-            f"     torch {torch.__version__} / CUDA {torch.version.cuda} / "
-            f"cuDNN {cudnn_v} / {platform.machine()}"
-        )
+    def transcribe(self, wavs: list[np.ndarray]) -> list[dict]:
+        t = self.tcfg
+        results = []
+        for wav in wavs:
+            segments, _info = self.model.transcribe(
+                wav,
+                language=t["language"],
+                task=t["task"],
+                beam_size=t["num_beams"],
+                condition_on_previous_text=t["condition_on_prev_text"],
+                compression_ratio_threshold=t["compression_ratio_threshold"],
+                log_prob_threshold=t["logprob_threshold"],
+                no_speech_threshold=0.6,
+                initial_prompt=t.get("initial_prompt"),
+                vad_filter=False,  # already segmented upstream by segment.py
+            )
+            segs = list(segments)  # generator: decoding happens here
+            text = " ".join(s.text.strip() for s in segs).strip()
 
-    dtype = DTYPES[tcfg["dtype"]] if device != "cpu" else torch.float32
-    if device.startswith("cuda") and dtype is torch.float16:
-        if torch.cuda.get_device_properties(0).major >= 8:
-            print("note: bfloat16 is the better choice on this GPU; set transcribe.dtype.")
+            if segs:
+                # Duration-weight the per-chunk scores rather than taking a flat mean,
+                # so a 0.5 s tail chunk cannot dominate a 20 s segment's confidence.
+                weights = np.array([max(s.end - s.start, 1e-3) for s in segs])
+                weights /= weights.sum()
+                avg_lp = float(np.sum(weights * np.array([s.avg_logprob for s in segs])))
+                no_speech = float(max(s.no_speech_prob for s in segs))
+            else:
+                avg_lp, no_speech = float("nan"), 1.0
 
-    is_peft, adapter_base, is_local = resolve_model_source(model_id)
-    base_id = tcfg.get("base_model_id") or adapter_base or model_id
-    if is_peft and not base_id:
-        raise SystemExit(
-            f"{model_id} is a LoRA adapter but its adapter_config.json has no "
-            f"base_model_name_or_path. Set transcribe.base_model_id (or pass "
-            f"--base-model-id), e.g. openai/whisper-large-v3."
-        )
-
-    source = "local" if is_local else "hub"
-    if is_peft:
-        print(f"PEFT adapter detected ({source}).\n  base    : {base_id}\n  adapter : {model_id}")
-        from peft import PeftModel
-
-        model = WhisperForConditionalGeneration.from_pretrained(
-            base_id, torch_dtype=dtype, attn_implementation="sdpa"
-        )
-        model = PeftModel.from_pretrained(model, model_id, torch_dtype=dtype)
-        model = model.merge_and_unload()  # fold LoRA into the base weights for fast inference
-    else:
-        print(f"Loading full model ({source}): {model_id}")
-        model = WhisperForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=dtype, attn_implementation="sdpa"
-        )
-
-    # The processor usually lives with the fine-tune; fall back to the base repo.
-    try:
-        processor = WhisperProcessor.from_pretrained(model_id)
-    except (OSError, ValueError):
-        processor = WhisperProcessor.from_pretrained(base_id)
-
-    model.to(device).eval()
-    print(f"Model on {device} ({dtype}).")
-    return model, processor, device, dtype
+            results.append(
+                {
+                    "text": text,
+                    "text_normalized": normalize_text(text),
+                    "avg_logprob": None if np.isnan(avg_lp) else round(avg_lp, 4),
+                    "no_speech_prob": round(no_speech, 4),
+                    "compression_ratio": round(compression_ratio(text), 3),
+                }
+            )
+        return results
 
 
-def compression_ratio(text: str) -> float:
-    """Whisper's repetition detector. >2.4 means the decoder is looping."""
-    data = text.encode("utf-8")
-    if not data:
-        return 0.0
-    return len(data) / len(zlib.compress(data))
+# -------------------------------------------------------------------------- HF backend
 
 
-@torch.no_grad()
-def transcribe_batch(batch_wavs, model, processor, device, dtype, tcfg) -> list[dict]:
-    sr = 16000
-    features = processor(
-        batch_wavs, sampling_rate=sr, return_tensors="pt", return_attention_mask=True
-    )
-    input_features = features.input_features.to(device, dtype=dtype)
+class HFBackend:
+    """transformers. Needed for PEFT/LoRA adapters and unconverted checkpoints."""
 
-    gen_kwargs = {
-        "num_beams": tcfg["num_beams"],
-        "language": tcfg["language"],
-        "task": tcfg["task"],
-        "return_dict_in_generate": True,
-        "output_scores": True,
-        "max_new_tokens": 440,
-    }
-    if tcfg.get("no_repeat_ngram_size"):
-        gen_kwargs["no_repeat_ngram_size"] = tcfg["no_repeat_ngram_size"]
-    if tcfg.get("initial_prompt"):
-        gen_kwargs["prompt_ids"] = processor.get_prompt_ids(
-            tcfg["initial_prompt"], return_tensors="pt"
-        ).to(device)
+    name = "hf"
 
-    out = model.generate(input_features, **gen_kwargs)
+    def __init__(self, cfg: dict):
+        import torch
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    # Average per-token log probability -- the primary confidence signal.
-    try:
-        transition = model.compute_transition_scores(
-            out.sequences,
-            out.scores,
-            getattr(out, "beam_indices", None),
-            normalize_logits=True,
-        )
-        transition = transition.float().cpu().numpy()
-        avg_logprobs = []
-        for row in transition:
-            valid = row[np.isfinite(row)]
-            avg_logprobs.append(float(valid.mean()) if valid.size else float("nan"))
-    except Exception:  # noqa: BLE001 - scoring must never kill a transcription run
-        avg_logprobs = [float("nan")] * out.sequences.shape[0]
+        self.torch = torch
+        tcfg = cfg["transcribe"]
+        self.tcfg = tcfg
+        model_id = tcfg["model_id"]
+        device = tcfg["device"]
 
-    texts = processor.batch_decode(out.sequences, skip_special_tokens=True)
+        if device.startswith("cuda"):
+            # Fail loudly. A silent CPU fallback on large-v3 is ~50x slower and easy to
+            # miss until you have burned a night on it.
+            if not torch.cuda.is_available():
+                raise SystemExit(
+                    "device: cuda requested but torch.cuda.is_available() is False.\n"
+                    f"  torch {torch.__version__}, built for CUDA {torch.version.cuda}, "
+                    f"machine {platform.machine()}\n"
+                    "Install a CUDA build (cuDNN ships inside the wheel):\n"
+                    f"  pip install torch torchaudio --index-url {_wheel_index_url()}\n"
+                    "Or set transcribe.device: cpu."
+                )
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True  # fixed 30 s input -> stable kernels
+            props = torch.cuda.get_device_properties(0)
+            print(
+                f"GPU: {props.name}  sm_{props.major}{props.minor}  "
+                f"{props.total_memory / 1e9:.0f} GB\n"
+                f"     torch {torch.__version__} / CUDA {torch.version.cuda} / "
+                f"cuDNN {torch.backends.cudnn.version()} / {platform.machine()}"
+            )
 
-    results = []
-    for text, lp in zip(texts, avg_logprobs):
-        text = text.strip()
-        cr = compression_ratio(text)
-        results.append(
-            {
-                "text": text,
-                "text_normalized": normalize_text(text),
-                "avg_logprob": None if np.isnan(lp) else round(lp, 4),
-                "compression_ratio": round(cr, 3),
+        dtypes = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        dtype = dtypes[tcfg["dtype"]] if device != "cpu" else torch.float32
+        if device.startswith("cuda") and dtype is torch.float16:
+            if torch.cuda.get_device_properties(0).major >= 8:
+                print("note: bfloat16 is the better choice on this GPU.")
+
+        is_peft, adapter_base, is_local = resolve_model_source(model_id)
+        base_id = tcfg.get("base_model_id") or adapter_base or model_id
+        if is_peft and not base_id:
+            raise SystemExit(
+                f"{model_id} is a LoRA adapter but adapter_config.json has no "
+                "base_model_name_or_path. Pass --base-model-id."
+            )
+
+        source = "local" if is_local else "hub"
+        if is_peft:
+            print(f"PEFT adapter ({source}).\n  base    : {base_id}\n  adapter : {model_id}")
+            from peft import PeftModel
+
+            model = WhisperForConditionalGeneration.from_pretrained(
+                base_id, torch_dtype=dtype, attn_implementation="sdpa"
+            )
+            model = PeftModel.from_pretrained(model, model_id, torch_dtype=dtype)
+            model = model.merge_and_unload()  # fold LoRA in for inference speed
+        else:
+            print(f"Loading HF model ({source}): {model_id}")
+            model = WhisperForConditionalGeneration.from_pretrained(
+                model_id, torch_dtype=dtype, attn_implementation="sdpa"
+            )
+
+        try:
+            processor = WhisperProcessor.from_pretrained(model_id)
+        except (OSError, ValueError):
+            processor = WhisperProcessor.from_pretrained(base_id)
+
+        self.model = model.to(device).eval()
+        self.processor = processor
+        self.device = device
+        self.dtype = dtype
+        print(f"Model on {device} ({dtype}).")
+
+    def transcribe(self, wavs: list[np.ndarray]) -> list[dict]:
+        torch = self.torch
+        t = self.tcfg
+        with torch.no_grad():
+            features = self.processor(
+                wavs, sampling_rate=SR, return_tensors="pt", return_attention_mask=True
+            )
+            input_features = features.input_features.to(self.device, dtype=self.dtype)
+
+            gen_kwargs = {
+                "num_beams": t["num_beams"],
+                "language": t["language"],
+                "task": t["task"],
+                "return_dict_in_generate": True,
+                "output_scores": True,
+                "max_new_tokens": 440,
             }
-        )
-    return results
+            if t.get("no_repeat_ngram_size"):
+                gen_kwargs["no_repeat_ngram_size"] = t["no_repeat_ngram_size"]
+            if t.get("initial_prompt"):
+                gen_kwargs["prompt_ids"] = self.processor.get_prompt_ids(
+                    t["initial_prompt"], return_tensors="pt"
+                ).to(self.device)
+
+            out = self.model.generate(input_features, **gen_kwargs)
+
+            try:
+                transition = self.model.compute_transition_scores(
+                    out.sequences,
+                    out.scores,
+                    getattr(out, "beam_indices", None),
+                    normalize_logits=True,
+                ).float().cpu().numpy()
+                avg_logprobs = []
+                for row in transition:
+                    valid = row[np.isfinite(row)]
+                    avg_logprobs.append(float(valid.mean()) if valid.size else float("nan"))
+            except Exception:  # noqa: BLE001 - scoring must never kill a run
+                avg_logprobs = [float("nan")] * out.sequences.shape[0]
+
+            texts = self.processor.batch_decode(out.sequences, skip_special_tokens=True)
+
+        results = []
+        for text, lp in zip(texts, avg_logprobs):
+            text = text.strip()
+            results.append(
+                {
+                    "text": text,
+                    "text_normalized": normalize_text(text),
+                    "avg_logprob": None if np.isnan(lp) else round(lp, 4),
+                    "no_speech_prob": None,  # not exposed by generate()
+                    "compression_ratio": round(compression_ratio(text), 3),
+                }
+            )
+        return results
+
+
+def load_backend(cfg: dict, forced: str | None = None):
+    backend = forced or detect_backend(cfg["transcribe"]["model_id"])
+    return CT2Backend(cfg) if backend == "ct2" else HFBackend(cfg)
+
+
+# ------------------------------------------------------------------------------- driver
 
 
 def flag_segment(row: dict, tcfg: dict) -> list[str]:
@@ -243,13 +377,15 @@ def flag_segment(row: dict, tcfg: dict) -> list[str]:
         flags.append("repetition_loop")
     if row["avg_logprob"] is not None and row["avg_logprob"] < tcfg["logprob_threshold"]:
         flags.append("low_confidence")
+    if row.get("no_speech_prob") is not None and row["no_speech_prob"] > 0.6 and row["text"]:
+        flags.append("likely_hallucination")
     words = row["text"].split()
     if words and row.get("duration") and len(words) / row["duration"] > 8:
         flags.append("impossible_rate")
     return flags
 
 
-def transcribe_video(video_id: str, cfg: dict, model, processor, device, dtype, overwrite: bool):
+def transcribe_video(video_id: str, cfg: dict, backend, overwrite: bool) -> int:
     tcfg = cfg["transcribe"]
     seg_manifest = Path(cfg["paths"]["manifests"]) / f"segments_{video_id}.jsonl"
     out_manifest = Path(cfg["paths"]["manifests"]) / f"transcripts_{video_id}.jsonl"
@@ -264,16 +400,17 @@ def transcribe_video(video_id: str, cfg: dict, model, processor, device, dtype, 
         return 0
 
     rows: list[dict] = []
-    bs = tcfg["batch_size"]
+    bs = tcfg["batch_size"] if backend.name == "hf" else 1
 
     for i in range(0, len(segments), bs):
         chunk = segments[i : i + bs]
         wavs = [load_audio(s["audio_path"], cfg["audio"]["sample_rate"]) for s in chunk]
-        preds = transcribe_batch(wavs, model, processor, device, dtype, tcfg)
+        preds = backend.transcribe(wavs)
 
         for seg, pred in zip(chunk, preds):
             row = {**seg, **pred}
             row["asr_model"] = tcfg["model_id"]
+            row["asr_backend"] = backend.name
             row["asr_language"] = tcfg["language"]
             row["asr_num_beams"] = tcfg["num_beams"]
             row["flags"] = flag_segment(row, tcfg)
@@ -285,22 +422,20 @@ def transcribe_video(video_id: str, cfg: dict, model, processor, device, dtype, 
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--config", default=None)
     ap.add_argument(
-        "--model-id",
-        default=None,
-        help="Hub repo id OR a local directory path (full fine-tune or LoRA adapter)",
+        "--model-id", default=None, help="Hub repo id OR local directory path"
     )
+    ap.add_argument("--model-path", default=None, help="alias for --model-id")
+    ap.add_argument("--base-model-id", default=None, help="base for a LoRA adapter")
     ap.add_argument(
-        "--model-path",
-        default=None,
-        help="alias for --model-id, for when the model is on local disk",
-    )
-    ap.add_argument(
-        "--base-model-id",
-        default=None,
-        help="base model for a LoRA adapter; also accepts a local path",
+        "--backend",
+        choices=["auto", "hf", "ct2"],
+        default="auto",
+        help="auto-detected from the model directory; override if detection is wrong",
     )
     ap.add_argument("--language", default=None)
     ap.add_argument("--batch-size", type=int, default=None)
@@ -321,8 +456,7 @@ def main() -> None:
 
     if "YOUR_HF_USERNAME" in cfg["transcribe"]["model_id"]:
         raise SystemExit(
-            "Set transcribe.model_id in configs/pipeline.yaml (or pass --model-id) "
-            "to your own Hub repo."
+            "Set transcribe.model_id in configs/pipeline.yaml (or pass --model-path)."
         )
 
     manifests = Path(cfg["paths"]["manifests"])
@@ -332,20 +466,17 @@ def main() -> None:
     if not video_ids:
         raise SystemExit("No segment manifests found. Run segment.py first.")
 
-    model, processor, device, dtype = load_model(cfg)
+    backend = load_backend(cfg, None if args.backend == "auto" else args.backend)
 
     total = 0
     for vid in tqdm(video_ids, desc="transcribe"):
         try:
-            total += transcribe_video(
-                vid, cfg, model, processor, device, dtype, args.overwrite
-            )
+            total += transcribe_video(vid, cfg, backend, args.overwrite)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! {vid} failed: {exc}")
 
     print(f"\n{total} segments transcribed.")
 
-    # Quick health report -- if auto_low dominates, fix decoding before annotating.
     tiers: dict[str, int] = {}
     for p in manifests.glob("transcripts_*.jsonl"):
         for row in read_jsonl(p):

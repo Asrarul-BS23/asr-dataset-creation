@@ -50,8 +50,10 @@ FEATURES = Features(
         "pause_after": Value("float32"),
         # pseudo-label confidence
         "avg_logprob": Value("float32"),
+        "no_speech_prob": Value("float32"),
         "compression_ratio": Value("float32"),
         "asr_model": Value("string"),
+        "asr_backend": Value("string"),
         "tier": Value("string"),
         "flags": Value("string"),
         # code-mixing
@@ -109,8 +111,10 @@ def collect_rows(cfg: dict, args) -> list[dict]:
                     "pause_before": r.get("pause_before") if r.get("pause_before") is not None else -1.0,
                     "pause_after": r.get("pause_after") if r.get("pause_after") is not None else -1.0,
                     "avg_logprob": r.get("avg_logprob") if r.get("avg_logprob") is not None else 0.0,
+                    "no_speech_prob": r.get("no_speech_prob") if r.get("no_speech_prob") is not None else -1.0,
                     "compression_ratio": r.get("compression_ratio", 0.0),
                     "asr_model": r.get("asr_model") or "",
+                    "asr_backend": r.get("asr_backend") or "",
                     "tier": r.get("tier") or "auto_high",
                     "flags": ",".join(r.get("flags") or []),
                     "cmi": stats["cmi"],

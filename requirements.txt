@@ -9,8 +9,12 @@ numpy>=1.26
 pyyaml>=6.0
 tqdm>=4.66
 
-# LoRA adapters (only needed if your HF repo is a PEFT adapter)
+# LoRA adapters (only needed if your model is a PEFT adapter)
 peft>=0.12
+
+# CTranslate2 backend (only needed if your model is a faster-whisper / CT2 export:
+# a directory holding model.bin + vocabulary.json rather than model.safetensors)
+faster-whisper>=1.0.3
 
 # Download + VAD
 yt-dlp>=2024.8.6
