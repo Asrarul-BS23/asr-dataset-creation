@@ -324,6 +324,20 @@ class HFBackend:
         self.device = device
         self.dtype = dtype
 
+        # Fine-tuned Whisper checkpoints routinely carry a stale `forced_decoder_ids`
+        # in their generation_config, e.g. [[1, None], [2, 50360]] -- note the None in
+        # the language slot. transformers warns that it will ignore this in favour of
+        # the explicit language=/task= we pass, but the None still reaches index
+        # arithmetic and surfaces as a CUDA device-side assert in a scatter kernel,
+        # with no usable Python traceback. We always pass language and task
+        # explicitly, so this field is pure liability -- clear it.
+        for holder, label in ((model.generation_config, "generation_config"),
+                              (model.config, "config")):
+            stale = getattr(holder, "forced_decoder_ids", None)
+            if stale is not None:
+                print(f"clearing stale {label}.forced_decoder_ids: {stale}")
+                holder.forced_decoder_ids = None
+
         # A tokenizer/model vocab mismatch is a common cause of a CUDA device-side
         # assert in a scatter kernel: suppress_tokens or a forced language token lands
         # outside the embedding, and the failure surfaces asynchronously with a
