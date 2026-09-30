@@ -1,6 +1,28 @@
+# torch is intentionally NOT listed here.
+#
+# pip has no reliable way to prefer a CUDA --index-url over the default PyPI index
+# when both publish a satisfying version, so listing `torch` here silently installs
+# PyPI's CPU-only wheel -- even on a GPU box, and even over an existing CUDA build.
+# Install it manually, once, before anything else:
+#
+#   DGX Spark (GB10, Blackwell sm_121, aarch64, cu130):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu130
+#   Colab / x86_64 (cu124):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# transformers, peft and silero-vad declare torch as an unpinned dependency, so
+# installing this file afterwards will NOT touch the CUDA build. Verify with:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+#
+# torchaudio is not required -- nothing in src/ imports it; audio I/O goes via ffmpeg.
+# If it is already installed, it MUST come from the same index and version as torch.
+# A leftover PyPI (+cpu) torchaudio next to a +cu130 torch fails at import with
+#   OSError: libtorchaudio.so: undefined symbol: ...
+# and transformers/audio_utils.py imports torchaudio whenever the package is present,
+# so this breaks the pipeline even though we never call it. Simplest fix:
+#   pip uninstall -y torchaudio
+
 # Core
-torch>=2.2
-torchaudio>=2.2
 transformers>=4.44
 datasets>=2.20
 accelerate>=0.33

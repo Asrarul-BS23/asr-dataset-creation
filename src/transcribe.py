@@ -333,13 +333,17 @@ class HFBackend:
             )
             input_features = features.input_features.to(self.device, dtype=self.dtype)
 
+            # No max_new_tokens: Whisper's decoder has only 448 positions, and
+            # max_new_tokens is added ON TOP of the forced decoder tokens. Setting it
+            # near the limit can overrun the position embedding, which surfaces as a
+            # CUDA device-side assert in a scatter kernel rather than a clear error.
+            # The model's own generation_config already caps this correctly.
             gen_kwargs = {
                 "num_beams": t["num_beams"],
                 "language": t["language"],
                 "task": t["task"],
                 "return_dict_in_generate": True,
                 "output_scores": True,
-                "max_new_tokens": 440,
             }
             if t.get("no_repeat_ngram_size"):
                 gen_kwargs["no_repeat_ngram_size"] = t["no_repeat_ngram_size"]

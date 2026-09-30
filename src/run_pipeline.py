@@ -34,6 +34,13 @@ def main() -> None:
     ap.add_argument("--urls", help="file with one URL / video ID / channel per line")
     ap.add_argument("--channel", action="append", default=[])
     ap.add_argument("--video", action="append", default=[])
+    ap.add_argument(
+        "--local-path",
+        action="append",
+        default=[],
+        help="local audio/video file or directory to ingest instead of downloading",
+    )
+    ap.add_argument("--recursive", action="store_true", help="with --local-path")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--model-id", default=None, help="Hub repo id or local directory path")
     ap.add_argument("--model-path", default=None, help="alias for --model-id (local disk)")
@@ -51,6 +58,16 @@ def main() -> None:
     common = ["--config", args.config] if args.config else []
 
     if "download" not in args.skip:
+        # Local files and YouTube both land in data/raw + data/meta, so they can be
+        # mixed freely in one corpus; every later stage reads only those directories.
+        if args.local_path:
+            extra = list(common)
+            for p in args.local_path:
+                extra += ["--path", p]
+            if args.recursive:
+                extra.append("--recursive")
+            run("ingest_local.py", extra)
+
         extra = list(common)
         if args.urls:
             extra += ["--urls", args.urls]
@@ -62,7 +79,7 @@ def main() -> None:
             extra += ["--limit", str(args.limit)]
         if len(extra) > len(common):
             run("download.py", extra)
-        else:
+        elif not args.local_path:
             print("No sources given; skipping download.")
 
     if "segment" not in args.skip:

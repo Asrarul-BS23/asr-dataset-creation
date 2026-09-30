@@ -1,6 +1,6 @@
 # Pipeline
 
-`download` → `segment` → `transcribe` → `build_dataset`
+`download` **or** `ingest_local` → `segment` → `transcribe` → `build_dataset`
 
 Every stage writes to disk and skips work already done, so you can interrupt and re-run
 anything without losing progress.
@@ -32,6 +32,34 @@ python src/build_dataset.py --exclude-flagged --push --hub-id myname/banglish-as
 `/videos` URL, which gets expanded automatically. `#` comments are ignored.
 
 Start with two or three videos and inspect the output before scaling up.
+
+## Local audio and video files
+
+YouTube isn't the only way in. `ingest_local.py` normalises any ffmpeg-readable file to
+16 kHz mono FLAC and writes it into `data/raw/` + `data/meta/`, which is the interface
+every later stage reads — so local material and downloaded material sit in one corpus
+and flow through identically.
+
+```powershell
+python src/ingest_local.py --path recording.mp4
+python src/ingest_local.py --path ~/podcasts --recursive
+python src/ingest_local.py --path ~/audio --glob "*.mp3" --license own-recording
+
+# or through the orchestrator
+python src/run_pipeline.py --local-path ~/podcasts --recursive --model-path <model>
+```
+
+Accepts mp4, mkv, mov, webm, mp3, m4a, wav, flac, ogg, opus, aac and friends. Video
+files have their audio track extracted; a file with no audio stream is reported and
+skipped rather than producing a silent FLAC.
+
+IDs come from the filename plus a short hash of the absolute path, so two files named
+`interview.mp3` in different folders don't collide, and re-running is idempotent.
+
+Worth using the provenance flags on your own recordings — `--license own-recording`,
+`--permission-ref <consent-form-id>`, `--channel <group>`, `--speaker-hint <note>`.
+These land in the dataset rows, and retrofitting provenance later is miserable (see
+`rnd-docs/07`).
 
 ## What each stage produces
 
