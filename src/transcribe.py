@@ -322,6 +322,30 @@ class HFBackend:
         self.processor = processor
         self.device = device
         self.dtype = dtype
+
+        # A tokenizer/model vocab mismatch is a common cause of a CUDA device-side
+        # assert in a scatter kernel: suppress_tokens or a forced language token lands
+        # outside the embedding, and the failure surfaces asynchronously with a
+        # useless stack trace. Check it here, where the error can still be readable.
+        n_embed = model.get_input_embeddings().weight.shape[0]
+        n_tok = len(processor.tokenizer)
+        gcfg = model.generation_config
+        worst = max(
+            list(getattr(gcfg, "suppress_tokens", None) or [0])
+            + list(getattr(gcfg, "begin_suppress_tokens", None) or [0])
+        )
+        print(f"vocab: embeddings={n_embed}  tokenizer={n_tok}  max_suppress_id={worst}")
+        if worst >= n_embed:
+            raise SystemExit(
+                f"generation_config suppresses token id {worst} but the model has only "
+                f"{n_embed} embeddings. The processor and the checkpoint disagree -- "
+                "pass --base-model-id to force a matching base."
+            )
+        if n_tok > n_embed:
+            print(
+                f"  WARNING: tokenizer has {n_tok} tokens vs {n_embed} embeddings; "
+                "the processor may not match this checkpoint."
+            )
         print(f"Model on {device} ({dtype}).")
 
     def transcribe(self, wavs: list[np.ndarray]) -> list[dict]:
@@ -332,6 +356,12 @@ class HFBackend:
                 wavs, sampling_rate=SR, return_tensors="pt", return_attention_mask=True
             )
             input_features = features.input_features.to(self.device, dtype=self.dtype)
+            # We asked the processor for an attention mask, so actually use it. Without
+            # it transformers warns on batched input and falls back to guessing from the
+            # pad token, which for Whisper is the same as eos.
+            attention_mask = getattr(features, "attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
 
             # No max_new_tokens: Whisper's decoder has only 448 positions, and
             # max_new_tokens is added ON TOP of the forced decoder tokens. Setting it
@@ -345,6 +375,8 @@ class HFBackend:
                 "return_dict_in_generate": True,
                 "output_scores": True,
             }
+            if attention_mask is not None:
+                gen_kwargs["attention_mask"] = attention_mask
             if t.get("no_repeat_ngram_size"):
                 gen_kwargs["no_repeat_ngram_size"] = t["no_repeat_ngram_size"]
             if t.get("initial_prompt"):
