@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import platform
+import traceback
 import zlib
 from pathlib import Path
 
@@ -498,6 +499,11 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--video", action="append", default=[])
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="re-raise on the first failure instead of continuing to the next video",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -530,7 +536,12 @@ def main() -> None:
         try:
             total += transcribe_video(vid, cfg, backend, args.overwrite)
         except Exception as exc:  # noqa: BLE001
+            # Print the stack, not just the message. A bare message discards exactly
+            # the information needed to debug a failure inside transformers.
             print(f"  ! {vid} failed: {exc}")
+            traceback.print_exc()
+            if args.fail_fast:
+                raise
 
     print(f"\n{total} segments transcribed.")
 
