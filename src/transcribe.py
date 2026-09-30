@@ -166,6 +166,27 @@ class CT2Backend:
                 compute_type=compute_type,
             )
         except (ValueError, RuntimeError) as exc:
+            msg = str(exc)
+
+            # PyPI ships CPU-only CTranslate2 wheels for aarch64. There is no CUDA build
+            # to pip install, so on DGX Spark this is a dead end unless you build CT2
+            # from source -- and the HF backend is the far cheaper answer.
+            if "not compiled with CUDA" in msg:
+                raise SystemExit(
+                    "CTranslate2 has no CUDA support in this install "
+                    f"({platform.machine()}: PyPI ships CPU-only wheels for ARM).\n"
+                    "\nPick one:\n"
+                    "  1. RECOMMENDED -- use the pre-conversion HF checkpoint or LoRA\n"
+                    "     adapter from the same training run, which runs on the GPU:\n"
+                    "       ls <your-training-outputs-dir>\n"
+                    "       python src/transcribe.py --model-path <hf-checkpoint>\n"
+                    "  2. Run this CT2 model on CPU (slow -- large-v3 at roughly\n"
+                    "     realtime, so hours per hour of audio):\n"
+                    "       set transcribe.device: cpu in configs/pipeline.yaml\n"
+                    "  3. Build CTranslate2 from source with CUDA for aarch64\n"
+                    "     (hours of work; only worth it for sustained bulk inference)."
+                ) from None
+
             if compute_type == "bfloat16":
                 print(f"  bfloat16 unsupported here ({exc}); falling back to float16.")
                 self.model = WhisperModel(
