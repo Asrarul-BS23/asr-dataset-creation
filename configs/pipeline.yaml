@@ -55,8 +55,15 @@ transcribe:
   # from adapter_config.json; set it if that field is missing, wrong, or you want the
   # base loaded from local disk too.
   base_model_id: null
-  language: "bn"
-  task: "transcribe"
+  # Leave BOTH null when the model was fine-tuned without a forced language token --
+  # that is the configuration the adapter was trained under, and it lets the model
+  # switch scripts mid-utterance instead of transliterating.
+  #
+  # Forcing language: "bn" on code-mixed audio makes the decoder render English speech
+  # phonetically in Bengali script ("How did" -> "হাউ ডিট"), which is precisely the
+  # failure this dataset exists to fix. Set it only to measure that effect.
+  language: null
+  task: null
   batch_size: 24               # DGX Spark has 128 GB unified memory; raise until VRAM bites
   num_beams: 5
   # Anti-hallucination / anti-drift. See rnd-docs/01.

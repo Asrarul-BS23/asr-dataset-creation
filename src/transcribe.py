@@ -204,8 +204,10 @@ class CT2Backend:
         for wav in wavs:
             segments, _info = self.model.transcribe(
                 wav,
-                language=t["language"],
-                task=t["task"],
+                # language=None means auto-detect per segment, which is what you want
+                # when the model was fine-tuned without a forced language token.
+                language=t.get("language") or None,
+                task=t.get("task") or "transcribe",
                 beam_size=t["num_beams"],
                 condition_on_previous_text=t["condition_on_prev_text"],
                 compression_ratio_threshold=t["compression_ratio_threshold"],
@@ -383,13 +385,21 @@ class HFBackend:
             # near the limit can overrun the position embedding, which surfaces as a
             # CUDA device-side assert in a scatter kernel rather than a clear error.
             # The model's own generation_config already caps this correctly.
+            # language/task are omitted entirely when null, rather than passed as None.
+            # Forcing a language token the model was not fine-tuned under is a
+            # train/inference mismatch: a code-switched model trained without a forced
+            # token will, under a forced <|bn|>, render English speech phonetically in
+            # Bengali script instead of switching scripts. Leave them unset to match
+            # how the adapter was trained.
             gen_kwargs = {
                 "num_beams": t["num_beams"],
-                "language": t["language"],
-                "task": t["task"],
                 "return_dict_in_generate": True,
                 "output_scores": True,
             }
+            if t.get("language"):
+                gen_kwargs["language"] = t["language"]
+            if t.get("task"):
+                gen_kwargs["task"] = t["task"]
             if attention_mask is not None:
                 gen_kwargs["attention_mask"] = attention_mask
             if t.get("no_repeat_ngram_size"):
@@ -401,18 +411,37 @@ class HFBackend:
 
             out = self.model.generate(input_features, **gen_kwargs)
 
+            # Confidence scoring, done entirely on CPU.
+            #
+            # Two hazards here, both of which cost a long debugging session:
+            #
+            #  1. With beam search, `beam_indices` is padded with -1 for beams that
+            #     finished early. Gathering on a negative index is an out-of-bounds
+            #     access -- on CUDA that is a device-side assert in a scatter kernel,
+            #     with no usable traceback. Clamp the padding away.
+            #  2. Doing this on CUDA inside a try/except is worse than useless: the
+            #     except swallows the Python error but the CUDA context stays poisoned,
+            #     so the failure resurfaces at the next unrelated CUDA call (for us,
+            #     batch_decode) and points the blame somewhere it does not belong.
+            #
+            # Moving the tensors to CPU first makes any failure local, recoverable and
+            # honestly reported. Scoring is cheap; this costs nothing measurable.
             try:
+                seq_cpu = out.sequences.cpu()
+                scores_cpu = [s.float().cpu() for s in out.scores]
+                beam_idx = getattr(out, "beam_indices", None)
+                if beam_idx is not None:
+                    beam_idx = beam_idx.cpu().clamp(min=0)
+
                 transition = self.model.compute_transition_scores(
-                    out.sequences,
-                    out.scores,
-                    getattr(out, "beam_indices", None),
-                    normalize_logits=True,
-                ).float().cpu().numpy()
+                    seq_cpu, scores_cpu, beam_idx, normalize_logits=True
+                ).float().numpy()
                 avg_logprobs = []
                 for row in transition:
                     valid = row[np.isfinite(row)]
                     avg_logprobs.append(float(valid.mean()) if valid.size else float("nan"))
-            except Exception:  # noqa: BLE001 - scoring must never kill a run
+            except Exception as exc:  # noqa: BLE001 - scoring must never kill a run
+                print(f"  (confidence scoring unavailable: {type(exc).__name__}: {exc})")
                 avg_logprobs = [float("nan")] * out.sequences.shape[0]
 
             texts = self.processor.batch_decode(out.sequences, skip_special_tokens=True)
@@ -457,7 +486,9 @@ def flag_segment(row: dict, tcfg: dict) -> list[str]:
     return flags
 
 
-def transcribe_video(video_id: str, cfg: dict, backend, overwrite: bool) -> int:
+def transcribe_video(
+    video_id: str, cfg: dict, backend, overwrite: bool, limit: int | None = None
+) -> int:
     tcfg = cfg["transcribe"]
     seg_manifest = Path(cfg["paths"]["manifests"]) / f"segments_{video_id}.jsonl"
     out_manifest = Path(cfg["paths"]["manifests"]) / f"transcripts_{video_id}.jsonl"
@@ -468,6 +499,10 @@ def transcribe_video(video_id: str, cfg: dict, backend, overwrite: bool) -> int:
         return 0
 
     segments = list(read_jsonl(seg_manifest))
+    if limit:
+        # Partial manifest: fine for a pilot, but re-running for the full set needs
+        # --overwrite, since the file now exists.
+        segments = segments[:limit]
     if not segments:
         return 0
 
@@ -512,6 +547,14 @@ def main() -> None:
     ap.add_argument("--language", default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--video", action="append", default=[])
+    ap.add_argument(
+        "--limit", type=int, default=None,
+        help="transcribe only the first N segments per video (pilot runs)",
+    )
+    ap.add_argument(
+        "--show", type=int, default=0,
+        help="print the first N transcripts when done, with their confidence signals",
+    )
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument(
         "--fail-fast",
@@ -548,7 +591,7 @@ def main() -> None:
     total = 0
     for vid in tqdm(video_ids, desc="transcribe"):
         try:
-            total += transcribe_video(vid, cfg, backend, args.overwrite)
+            total += transcribe_video(vid, cfg, backend, args.overwrite, args.limit)
         except Exception as exc:  # noqa: BLE001
             # Print the stack, not just the message. A bare message discards exactly
             # the information needed to debug a failure inside transformers.
@@ -564,6 +607,29 @@ def main() -> None:
         for row in read_jsonl(p):
             tiers[row["tier"]] = tiers.get(row["tier"], 0) + 1
     print(f"tiers: {tiers}")
+
+    if args.show:
+        from normalize import codemix_stats
+
+        print(f"\n{'=' * 78}\n  first {args.show} transcripts\n{'=' * 78}")
+        shown = 0
+        for p in sorted(manifests.glob("transcripts_*.jsonl")):
+            for row in read_jsonl(p):
+                if shown >= args.show:
+                    break
+                cm = codemix_stats(row["text"])
+                lp = row.get("avg_logprob")
+                print(
+                    f"\n[{shown:3}] {row['id']}  {row['duration']:.1f}s  "
+                    f"logprob={lp if lp is not None else 'n/a'}  "
+                    f"cmi={cm['cmi']}  latin={cm['latin_ratio']}  "
+                    f"tier={row['tier']}"
+                    + (f"  flags={','.join(row['flags'])}" if row.get("flags") else "")
+                )
+                print(f"      {row['text']}")
+                shown += 1
+            if shown >= args.show:
+                break
 
 
 if __name__ == "__main__":
