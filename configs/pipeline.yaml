@@ -75,6 +75,22 @@ transcribe:
   dtype: "bfloat16"          # bfloat16 on Blackwell/Ampere+; float16 | float32 otherwise
   initial_prompt: null       # e.g. "startup, funding, deployment, API, machine learning"
 
+# Used only by src/transcribe_gemma.py. Writes the same manifests as transcribe.py,
+# so build_dataset.py is unchanged -- but copy the output aside between runs if you
+# want to compare the two labelers rather than overwrite one with the other.
+gemma:
+  # AUDIO IS ONLY ON E2B, E4B AND 12B. The 26B A4B and 31B are text+image and will
+  # fail here. 12B is the largest audio-capable variant.
+  #   google/gemma-4-E4B-it    small, fast, good for a first look
+  #   <the 12B audio repo id>  largest audio-capable -- confirm the exact id on the Hub
+  model_id: "google/gemma-4-E4B-it"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_new_tokens: 256        # 25 s of speech is well under this; caps runaway output
+  # null uses DEFAULT_PROMPT in transcribe_gemma.py, which states the rnd-docs/04
+  # orthography rule (Bangla in Bengali script, English in Latin) to the model directly.
+  prompt: null
+
 dataset:
   name: "banglish-asr"
   test_size: 0.05

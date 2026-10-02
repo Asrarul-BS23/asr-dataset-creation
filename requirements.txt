@@ -22,23 +22,32 @@
 # so this breaks the pipeline even though we never call it. Simplest fix:
 #   pip uninstall -y torchaudio
 
-# Core
-transformers>=4.44
-datasets>=2.20
-accelerate>=0.33
-soundfile>=0.12
+# Pinned to match whisper-finetuning/requirements/train.in.
+#
+# These versions are a KNOWN-GOOD configuration: the adapter in outputs/ was trained
+# and run with them on this same DGX Spark. Floors (>=) let this venv resolve to
+# whatever was newest, which meant debugging an environment that had never been proven
+# to work instead of reproducing one that had. Inference and training should load the
+# same checkpoint through the same library versions -- a model saved by transformers
+# 4.51 / peft 0.15 is not guaranteed to load identically under much newer ones.
+transformers==4.51.0
+peft==0.15.0
+datasets==3.5.0
+accelerate==1.6.0
+huggingface_hub>=0.30.0,<1.0
+soundfile>=0.12.1
+PyYAML==6.0.2
 numpy>=1.26
-pyyaml>=6.0
 tqdm>=4.66
 
-# LoRA adapters (only needed if your model is a PEFT adapter)
-peft>=0.12
-
 # CTranslate2 backend (only needed if your model is a faster-whisper / CT2 export:
-# a directory holding model.bin + vocabulary.json rather than model.safetensors)
-faster-whisper>=1.0.3
+# a directory holding model.bin + vocabulary.json rather than model.safetensors).
+# Same pins as training. NOTE: PyPI ships CPU-only ctranslate2 wheels for aarch64,
+# so this backend cannot use the GPU on DGX Spark -- see rnd-docs/10 section 5.
+ctranslate2==4.5.0
+faster-whisper==1.1.0
 
-# Download + VAD
+# Pipeline-only (not in the training stack)
 yt-dlp>=2024.8.6
 silero-vad>=5.1
 

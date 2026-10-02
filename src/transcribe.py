@@ -544,7 +544,8 @@ def main() -> None:
         default="auto",
         help="auto-detected from the model directory; override if detection is wrong",
     )
-    ap.add_argument("--language", default=None)
+    ap.add_argument("--language", default=None, help='e.g. "bn"; omit to auto-detect')
+    ap.add_argument("--task", default=None, choices=["transcribe", "translate"])
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--video", action="append", default=[])
     ap.add_argument(
@@ -571,6 +572,8 @@ def main() -> None:
         cfg["transcribe"]["base_model_id"] = args.base_model_id
     if args.language:
         cfg["transcribe"]["language"] = args.language
+    if args.task:
+        cfg["transcribe"]["task"] = args.task
     if args.batch_size:
         cfg["transcribe"]["batch_size"] = args.batch_size
 
