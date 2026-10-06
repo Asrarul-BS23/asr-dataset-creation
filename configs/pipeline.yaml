@@ -84,7 +84,7 @@ gemma:
   #   google/gemma-4-E4B-it    small, fast, good for a first look
   #   <the 12B audio repo id>  largest audio-capable -- confirm the exact id on the Hub
   model_id: "google/gemma-4-E4B-it"
-  device: "cuda"
+  device: "cpu"
   dtype: "bfloat16"
   max_new_tokens: 256        # 25 s of speech is well under this; caps runaway output
   # null uses DEFAULT_PROMPT in transcribe_gemma.py, which states the rnd-docs/04

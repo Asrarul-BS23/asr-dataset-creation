@@ -51,6 +51,17 @@ faster-whisper==1.1.0
 yt-dlp>=2024.8.6
 silero-vad>=5.1
 
+# --------------------------------------------------------------------------------
+# src/transcribe_gemma.py only. INSTALL THESE IN A SEPARATE VENV: Gemma 4 needs a
+# much newer transformers than the 4.51.0 pinned above for the Whisper adapter, and
+# the two cannot coexist.
+#
+#   pip install --upgrade transformers accelerate torch soundfile numpy pyyaml tqdm pillow
+#
+# pillow is required even for audio-only use: Gemma4Processor is multimodal
+# (image + audio) and imports PIL unconditionally.
+# --------------------------------------------------------------------------------
+
 # ffmpeg must be on PATH (not a pip package):
 #   winget install Gyan.FFmpeg      (Windows)
 #   conda install -c conda-forge ffmpeg

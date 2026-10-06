@@ -115,11 +115,19 @@ class GemmaBackend:
                 "See requirements.txt for the right wheel index."
             )
 
+        # Honour the configured dtype on CPU too. Forcing float32 doubles the memory
+        # for no accuracy that matters here, and bfloat16 CPU inference works on recent
+        # torch -- slow, but the alternative is often not fitting in RAM at all.
+        # float16 on CPU is genuinely bad (little kernel coverage), so redirect it.
+        want = gcfg["dtype"]
+        if device == "cpu" and want == "float16":
+            print("note: float16 is poorly supported on CPU; using bfloat16 instead.")
+            want = "bfloat16"
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
-        }[gcfg["dtype"] if device != "cpu" else "float32"]
+        }[want]
 
         print(f"Loading Gemma ({device}, {dtype}): {model_id}")
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -263,7 +271,18 @@ def main() -> None:
     ap.add_argument("--config", default=None)
     ap.add_argument("--model-id", default=None, help="Hub repo id or local path")
     ap.add_argument("--prompt", default=None, help="override the transcription prompt")
+    ap.add_argument(
+        "--device", default=None, choices=["cuda", "cpu"],
+        help="override gemma.device -- the config is shared across machines, so set "
+             "this per run rather than committing a machine-specific value",
+    )
+    ap.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--video", action="append", default=[])
+    ap.add_argument(
+        "--audio", action="append", default=[],
+        help="transcribe these audio files directly and print the result, bypassing "
+             "the manifests entirely (for smoke-testing the model on any machine)",
+    )
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--show", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
@@ -276,8 +295,30 @@ def main() -> None:
         cfg["gemma"]["model_id"] = args.model_id
     if args.prompt:
         cfg["gemma"]["prompt"] = args.prompt
+    if args.device:
+        cfg["gemma"]["device"] = args.device
+    if args.dtype:
+        cfg["gemma"]["dtype"] = args.dtype
 
     manifests = Path(cfg["paths"]["manifests"])
+
+    # Ad-hoc mode: no manifests, no pipeline state. The point is to prove the model
+    # loads and the chat template works on this machine before trusting a real run.
+    if args.audio:
+        backend = GemmaBackend(cfg)
+        for f in args.audio:
+            p = Path(f).expanduser()
+            if not p.exists():
+                print(f"  ! not found: {p}")
+                continue
+            wav = load_audio(p, cfg["audio"]["sample_rate"])
+            print(f"\n{p.name}  ({len(wav) / cfg['audio']['sample_rate']:.1f}s)")
+            pred = backend.transcribe([wav])[0]
+            print(f"  TEXT: {pred['text']}")
+            if pred.get("raw_output"):
+                print(f"  (cleaned from: {pred['raw_output'][:160]!r})")
+        return
+
     video_ids = args.video or sorted(
         p.stem.replace("segments_", "") for p in manifests.glob("segments_*.jsonl")
     )

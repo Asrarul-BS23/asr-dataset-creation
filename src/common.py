@@ -91,8 +91,27 @@ def have_ffmpeg() -> bool:
 def load_audio(path: str | Path, sample_rate: int = 16000) -> np.ndarray:
     """Decode any audio file to a mono float32 numpy array at `sample_rate`.
 
-    Goes through ffmpeg so we do not care what container yt-dlp handed us.
+    Fast path: our own segments are already 16 kHz mono WAV/FLAC, which soundfile
+    reads directly. That skips a subprocess spawn per segment (hundreds per run) and
+    means transcription needs no ffmpeg at all -- useful on a machine that only has
+    the segments, not the harvesting toolchain.
+
+    Everything else falls through to ffmpeg, so we still do not care what container
+    yt-dlp handed us.
     """
+    path = Path(path)
+    if path.suffix.lower() in (".wav", ".flac"):
+        try:
+            import soundfile as sf
+
+            data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            if sr == sample_rate:
+                return np.ascontiguousarray(data, dtype=np.float32)
+        except Exception:  # noqa: BLE001 - any problem: use ffmpeg instead
+            pass
+
     cmd = [
         "ffmpeg", "-nostdin", "-threads", "1", "-i", str(path),
         "-f", "f32le", "-acodec", "pcm_f32le",
